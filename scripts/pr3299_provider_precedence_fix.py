@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 path = Path('rust/crates/rusty-claude-cli/src/main.rs')
 text = path.read_text()
@@ -28,3 +29,4 @@ if test_marker not in text:
     raise SystemExit('runtime precedence test anchor missing')
 text = text.replace(test_marker, test + test_marker, 1)
 path.write_text(text)
+subprocess.run(['cargo', 'fmt', '--all'], cwd='rust', check=True)
