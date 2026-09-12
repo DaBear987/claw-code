@@ -1,5 +1,4 @@
 from pathlib import Path
-import subprocess
 
 path = Path('rust/crates/rusty-claude-cli/src/main.rs')
 text = path.read_text()
@@ -29,11 +28,3 @@ if test_marker not in text:
     raise SystemExit('runtime precedence test anchor missing')
 text = text.replace(test_marker, test + test_marker, 1)
 path.write_text(text)
-
-subprocess.run(['git', 'config', 'user.name', 'DaBear987'], check=True)
-subprocess.run(['git', 'config', 'user.email', '197504317+DaBear987@users.noreply.github.com'], check=True)
-subprocess.run(['git', 'add', str(path)], check=True)
-subprocess.run(['git', 'commit', '-m', 'fix: honor explicit model provider over persisted config'], check=True)
-subprocess.run(['git', 'push', 'origin', 'HEAD:main'], check=True)
-subprocess.run(['git', 'fetch', 'origin', 'main'], check=True)
-subprocess.run(['git', 'reset', '--hard', 'origin/main'], check=True)
