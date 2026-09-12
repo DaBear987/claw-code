@@ -12563,6 +12563,51 @@ fn provider_config_from_runtime(
     }))
 }
 
+fn explicit_provider_kind_for_model(
+    model: &str,
+    persisted_model: &str,
+) -> Option<api::ProviderConfigKind> {
+    let resolved_model = api::resolve_model_alias(model);
+    let persisted_resolved = api::resolve_model_alias(persisted_model);
+
+    if resolved_model.eq_ignore_ascii_case(&persisted_resolved) {
+        return None;
+    }
+
+    let namespace = model
+        .trim()
+        .split_once('/')
+        .map(|(namespace, _)| namespace.to_ascii_lowercase());
+
+    match namespace.as_deref() {
+        Some("anthropic") => Some(api::ProviderConfigKind::Anthropic),
+        Some("xai") => Some(api::ProviderConfigKind::Xai),
+        Some("openai") | Some("local") => Some(api::ProviderConfigKind::OpenAi),
+        Some("dashscope") | Some("qwen") | Some("kimi") => Some(api::ProviderConfigKind::DashScope),
+        _ => {
+            let lower = resolved_model.to_ascii_lowercase();
+            if lower.starts_with("qwen/")
+                || lower.starts_with("qwen-")
+                || lower.starts_with("kimi/")
+                || lower.starts_with("kimi-")
+            {
+                Some(api::ProviderConfigKind::DashScope)
+            } else if lower.starts_with("grok/") || lower.starts_with("grok-") {
+                Some(api::ProviderConfigKind::Xai)
+            } else if lower.starts_with("claude") || lower.starts_with("anthropic/") {
+                Some(api::ProviderConfigKind::Anthropic)
+            } else if lower.starts_with("openai/")
+                || lower.starts_with("gpt-")
+                || lower.starts_with("local/")
+            {
+                Some(api::ProviderConfigKind::OpenAi)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
     client: ApiProviderClient,
@@ -12590,6 +12635,17 @@ impl AnthropicRuntimeClient {
         // Explicit persisted provider configuration takes precedence.
         // When absent, preserve the existing model-based provider detection.
         let resolved_model = api::resolve_model_alias(&model);
+        let provider_config = provider_config.map(|config| {
+            if let Some(kind) = explicit_provider_kind_for_model(&model, config.model.as_str()) {
+                api::ProviderConfig {
+                    kind,
+                    model: resolved_model.clone(),
+                    ..config
+                }
+            } else {
+                config
+            }
+        });
         let client = if let Some(config) = provider_config {
             match config.kind {
                 api::ProviderConfigKind::Anthropic => {
@@ -19206,6 +19262,58 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn explicit_model_provider_hint_overrides_persisted_provider_kind() {
+        let config = api::ProviderConfig {
+            kind: api::ProviderConfigKind::DashScope,
+            model: "qwen-plus".to_string(),
+            api_key: Some("persisted-test-key".to_string()),
+            base_url: None,
+        };
+
+        assert_eq!(
+            super::explicit_provider_kind_for_model("openai/gpt-5", &config.model),
+            Some(api::ProviderConfigKind::OpenAi)
+        );
+        assert_eq!(
+            super::explicit_provider_kind_for_model("qwen-plus", &config.model),
+            None,
+            "matching persisted model must keep the persisted provider kind"
+        );
+    }
+
+    #[test]
+    fn explicit_model_provider_hint_controls_runtime_provider_dispatch() {
+        let config = api::ProviderConfig {
+            kind: api::ProviderConfigKind::DashScope,
+            model: "qwen-plus".to_string(),
+            api_key: Some("persisted-test-key".to_string()),
+            base_url: None,
+        };
+
+        let runtime = super::AnthropicRuntimeClient::new(
+            "provider-resolution-explicit-model-test",
+            "openai/gpt-5".to_string(),
+            false,
+            false,
+            None,
+            GlobalToolRegistry::builtin(),
+            None,
+            Some(config),
+        )
+        .expect("runtime client should construct from explicit model provider hint");
+
+        match runtime.client {
+            api::ProviderClient::OpenAi(client) => {
+                assert!(client.base_url().contains("api.openai.com"));
+                assert!(!client.base_url().contains("dashscope.aliyuncs.com"));
+            }
+            other => panic!(
+                "explicit OpenAI model prefix must override persisted DashScope configuration, got {other:?}"
+            ),
+        }
     }
 
     #[test]

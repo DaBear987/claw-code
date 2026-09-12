@@ -6,9 +6,6 @@ on:
   pull_request:
     branches: [ "main" ]
 
-permissions:
-  contents: write
-
 env:
   CARGO_TERM_COLOR: always
 
@@ -22,31 +19,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-    - name: Apply PR3299 provider precedence fix
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-      working-directory: .
-      run: python3 scripts/pr3299_provider_precedence_fix.py
-    - name: Format check
-      run: cargo fmt --all -- --check
-    - name: API provider regression tests
-      run: cargo test -p api persisted_provider_kind_overrides_model_provider_detection
-    - name: Runtime configuration regression test
-      run: cargo test -p runtime loads_persisted_provider_configuration_from_settings
-    - name: CLI provider precedence regression tests
-      run: cargo test -p rusty-claude-cli explicit_model_provider_hint
-    - name: Commit verified PR3299 fix and cleanup
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-      working-directory: .
-      run: |
-        git config user.name 'DaBear987'
-        git config user.email '197504317+DaBear987@users.noreply.github.com'
-        python3 - <<'PY'
-        from pathlib import Path
-        path = Path('.github/workflows/rust.yml')
-        path.write_text('''name: Rust\n\non:\n  push:\n    branches: [ "main" ]\n  pull_request:\n    branches: [ "main" ]\n\nenv:\n  CARGO_TERM_COLOR: always\n\ndefaults:\n  run:\n    working-directory: rust\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n\n    steps:\n    - uses: actions/checkout@v4\n    - name: Build\n      run: cargo build --verbose\n    - name: Run tests\n      run: cargo test --verbose\n''')
-        Path('.github/workflows/pr3299-provider-precedence.yml').unlink(missing_ok=True)
-        Path('scripts/pr3299_provider_precedence_fix.py').unlink(missing_ok=True)
-        PY
-        git add -A
-        git commit -m 'fix: honor explicit model provider over persisted config'
-        git push origin HEAD:main
+    - name: Build
+      run: cargo build --verbose
+    - name: Run tests
+      run: cargo test --verbose
