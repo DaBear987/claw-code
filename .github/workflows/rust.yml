@@ -27,3 +27,12 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+    - name: Export verified provider precedence source
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: actions/upload-artifact@v4
+      with:
+        name: pr3299-provider-precedence-source-${{ github.sha }}
+        path: |
+          rust/crates/rusty-claude-cli/src/main.rs
+          /home/runner/work/claw-code/claw-code/rust/crates/rusty-claude-cli/src/main.rs
+        if-no-files-found: error
