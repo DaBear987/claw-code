@@ -12416,6 +12416,7 @@ fn build_runtime_with_plugin_state(
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
+    let provider_config = provider_config_from_runtime(feature_config.provider())?;
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -12426,6 +12427,7 @@ fn build_runtime_with_plugin_state(
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
+            provider_config,
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
@@ -12527,10 +12529,85 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 
 // NOTE: Despite the historical name `AnthropicRuntimeClient`, this struct
 // now holds an `ApiProviderClient` which dispatches to Anthropic, xAI,
-// OpenAI, or DashScope at construction time based on
-// `detect_provider_kind(&model)`. The struct name is kept to avoid
-// churning `BuiltRuntime` and every Deref/DerefMut site that references
-// it. See ROADMAP #29 for the provider-dispatch routing fix.
+// OpenAI, or DashScope at construction time. Explicit persisted provider
+// configuration takes precedence; model-based provider detection remains
+// the fallback when no provider configuration is present. The struct name
+// is kept to avoid churning `BuiltRuntime` and every Deref/DerefMut site
+// that references it.
+
+fn provider_config_from_runtime(
+    provider: &runtime::RuntimeProviderConfig,
+) -> Result<Option<api::ProviderConfig>, Box<dyn std::error::Error>> {
+    let Some(kind) = provider.kind() else {
+        return Ok(None);
+    };
+
+    let kind = match kind.trim().to_ascii_lowercase().as_str() {
+        "anthropic" => api::ProviderConfigKind::Anthropic,
+        "xai" => api::ProviderConfigKind::Xai,
+        "openai" => api::ProviderConfigKind::OpenAi,
+        "dashscope" => api::ProviderConfigKind::DashScope,
+        other => {
+            return Err(format!(
+                "invalid provider configuration: unsupported provider kind `{other}`"
+            )
+            .into());
+        }
+    };
+
+    Ok(Some(api::ProviderConfig {
+        kind,
+        model: provider.model().unwrap_or_default().to_string(),
+        api_key: provider.api_key().map(str::to_string),
+        base_url: provider.base_url().map(str::to_string),
+    }))
+}
+
+fn explicit_provider_kind_for_model(
+    model: &str,
+    persisted_model: &str,
+) -> Option<api::ProviderConfigKind> {
+    let resolved_model = api::resolve_model_alias(model);
+    let persisted_resolved = api::resolve_model_alias(persisted_model);
+
+    if resolved_model.eq_ignore_ascii_case(&persisted_resolved) {
+        return None;
+    }
+
+    let namespace = model
+        .trim()
+        .split_once('/')
+        .map(|(namespace, _)| namespace.to_ascii_lowercase());
+
+    match namespace.as_deref() {
+        Some("anthropic") => Some(api::ProviderConfigKind::Anthropic),
+        Some("xai") => Some(api::ProviderConfigKind::Xai),
+        Some("openai") | Some("local") => Some(api::ProviderConfigKind::OpenAi),
+        Some("dashscope") | Some("qwen") | Some("kimi") => Some(api::ProviderConfigKind::DashScope),
+        _ => {
+            let lower = resolved_model.to_ascii_lowercase();
+            if lower.starts_with("qwen/")
+                || lower.starts_with("qwen-")
+                || lower.starts_with("kimi/")
+                || lower.starts_with("kimi-")
+            {
+                Some(api::ProviderConfigKind::DashScope)
+            } else if lower.starts_with("grok/") || lower.starts_with("grok-") {
+                Some(api::ProviderConfigKind::Xai)
+            } else if lower.starts_with("claude") || lower.starts_with("anthropic/") {
+                Some(api::ProviderConfigKind::Anthropic)
+            } else if lower.starts_with("openai/")
+                || lower.starts_with("gpt-")
+                || lower.starts_with("local/")
+            {
+                Some(api::ProviderConfigKind::OpenAi)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 struct AnthropicRuntimeClient {
     runtime: tokio::runtime::Runtime,
     client: ApiProviderClient,
@@ -12553,47 +12630,65 @@ impl AnthropicRuntimeClient {
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
+        provider_config: Option<api::ProviderConfig>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Dispatch to the correct provider at construction time.
-        // `ApiProviderClient` (exposed by the api crate as
-        // `ProviderClient`) is an enum over Anthropic / xAI / OpenAI
-        // variants, where xAI and OpenAI both use the OpenAI-compat
-        // wire format under the hood. We consult
-        // `detect_provider_kind(&resolved_model)` so model-name prefix
-        // routing (`openai/`, `gpt-`, `grok`, `qwen/`) wins over
-        // env-var presence.
-        //
-        // For Anthropic we build the client directly instead of going
-        // through `ApiProviderClient::from_model_with_anthropic_auth`
-        // so we can explicitly apply `api::read_base_url()` — that
-        // reads `ANTHROPIC_BASE_URL` and is required for the local
-        // mock-server test harness
-        // (`crates/rusty-claude-cli/tests/compact_output.rs`) to point
-        // claw at its fake Anthropic endpoint. We also attach a
-        // session-scoped prompt cache on the Anthropic path; the
-        // prompt cache is Anthropic-only so non-Anthropic variants
-        // skip it.
+        // Explicit persisted provider configuration takes precedence.
+        // When absent, preserve the existing model-based provider detection.
         let resolved_model = api::resolve_model_alias(&model);
-        let client = match detect_provider_kind(&resolved_model) {
-            ProviderKind::Anthropic => {
-                let auth = resolve_cli_auth_source()?;
-                let inner = AnthropicClient::from_auth(auth)
-                    .with_base_url(api::read_base_url())
-                    .with_prompt_cache(PromptCache::new(session_id));
-                ApiProviderClient::Anthropic(inner)
+        let provider_config = provider_config.map(|config| {
+            if let Some(kind) = explicit_provider_kind_for_model(&model, config.model.as_str()) {
+                api::ProviderConfig {
+                    kind,
+                    model: resolved_model.clone(),
+                    ..config
+                }
+            } else {
+                config
             }
-            ProviderKind::Xai | ProviderKind::OpenAi => {
-                // The api crate's `ProviderClient::from_model_with_anthropic_auth`
-                // with `None` for the anthropic auth routes via
-                // `detect_provider_kind` and builds an
-                // `OpenAiCompatClient::from_env` with the matching
-                // `OpenAiCompatConfig` (openai / xai / dashscope).
-                // That reads the correct API-key env var and BASE_URL
-                // override internally, so this one call covers OpenAI,
-                // OpenRouter, xAI, DashScope, Ollama, and any other
-                // OpenAI-compat endpoint users configure via
-                // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
-                ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+        });
+        let client = if let Some(config) = provider_config {
+            match config.kind {
+                api::ProviderConfigKind::Anthropic => {
+                    let auth = match resolve_cli_auth_source() {
+                        Ok(auth) => auth,
+                        Err(_) => {
+                            config
+                                .api_key
+                                .clone()
+                                .map(AuthSource::ApiKey)
+                                .ok_or_else(|| {
+                                    api::ApiError::missing_credentials(
+                                        "Anthropic",
+                                        &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
+                                    )
+                                })?
+                        }
+                    };
+                    let mut inner = AnthropicClient::from_auth(auth);
+                    let base_url = std::env::var("ANTHROPIC_BASE_URL")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                        .or_else(|| config.base_url.clone())
+                        .unwrap_or_else(api::read_base_url);
+                    inner = inner.with_base_url(base_url);
+                    ApiProviderClient::Anthropic(
+                        inner.with_prompt_cache(PromptCache::new(session_id)),
+                    )
+                }
+                _ => ApiProviderClient::from_config(&config)?,
+            }
+        } else {
+            match detect_provider_kind(&resolved_model) {
+                ProviderKind::Anthropic => {
+                    let auth = resolve_cli_auth_source()?;
+                    let inner = AnthropicClient::from_auth(auth)
+                        .with_base_url(api::read_base_url())
+                        .with_prompt_cache(PromptCache::new(session_id));
+                    ApiProviderClient::Anthropic(inner)
+                }
+                ProviderKind::Xai | ProviderKind::OpenAi => {
+                    ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+                }
             }
         };
         Ok(Self {
@@ -19167,6 +19262,117 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn explicit_model_provider_hint_overrides_persisted_provider_kind() {
+        let config = api::ProviderConfig {
+            kind: api::ProviderConfigKind::DashScope,
+            model: "qwen-plus".to_string(),
+            api_key: Some("persisted-test-key".to_string()),
+            base_url: None,
+        };
+
+        assert_eq!(
+            super::explicit_provider_kind_for_model("openai/gpt-5", &config.model),
+            Some(api::ProviderConfigKind::OpenAi)
+        );
+        assert_eq!(
+            super::explicit_provider_kind_for_model("qwen-plus", &config.model),
+            None,
+            "matching persisted model must keep the persisted provider kind"
+        );
+    }
+
+    #[test]
+    fn explicit_model_provider_hint_controls_runtime_provider_dispatch() {
+        let config = api::ProviderConfig {
+            kind: api::ProviderConfigKind::DashScope,
+            model: "qwen-plus".to_string(),
+            api_key: Some("persisted-test-key".to_string()),
+            base_url: None,
+        };
+
+        let runtime = super::AnthropicRuntimeClient::new(
+            "provider-resolution-explicit-model-test",
+            "openai/gpt-5".to_string(),
+            false,
+            false,
+            None,
+            GlobalToolRegistry::builtin(),
+            None,
+            Some(config),
+        )
+        .expect("runtime client should construct from explicit model provider hint");
+
+        match runtime.client {
+            api::ProviderClient::OpenAi(client) => {
+                assert!(client.base_url().contains("api.openai.com"));
+                assert!(!client.base_url().contains("dashscope.aliyuncs.com"));
+            }
+            other => panic!(
+                "explicit OpenAI model prefix must override persisted DashScope configuration, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn persisted_provider_configuration_controls_runtime_provider_dispatch() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{
+              "provider": {
+                "kind": "dashscope",
+                "apiKey": "persisted-test-key",
+                "baseUrl": "https://dashscope.example/v1",
+                "model": "qwen-plus"
+              },
+              "model": "qwen-plus"
+            }"#,
+        )
+        .expect("write provider settings");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let state = build_runtime_plugin_state_with_loader(&workspace, &loader, &runtime_config)
+            .expect("runtime plugin state should load");
+
+        let provider_config = super::provider_config_from_runtime(state.feature_config.provider())
+            .expect("provider configuration should adapt")
+            .expect("persisted provider configuration should be present");
+
+        assert_eq!(
+            provider_config.kind,
+            api::ProviderConfigKind::DashScope,
+            "persisted provider kind must survive the runtime configuration boundary"
+        );
+
+        let runtime = super::AnthropicRuntimeClient::new(
+            "provider-resolution-test",
+            "qwen-plus".to_string(),
+            false,
+            false,
+            None,
+            GlobalToolRegistry::builtin(),
+            None,
+            Some(provider_config),
+        )
+        .expect("runtime client should construct from persisted provider configuration");
+
+        match runtime.client {
+            api::ProviderClient::OpenAi(_) => {}
+            other => panic!(
+                "persisted DashScope configuration must dispatch to the OpenAI-compatible client, got {other:?}"
+            ),
+        }
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]
